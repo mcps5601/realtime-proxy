@@ -16,12 +16,10 @@ import (
 
 const (
 	openAIRealtimeURL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
-	// 你的 client 音訊規格（你目前做的是 PCM16 16kHz mono）
-	inRateHz  = 24000
-	outRateHz = 24000
 
-	// 「一句話結束」的簡易判斷：多久沒新音訊就 commit+response.create
-	idleCommitAfter = 600 * time.Millisecond
+	// Realtime audio/pcm rate 最低 >= 24000（你已經踩過 16000 會被拒絕）
+	rateHz = 24000
+	ch     = 1
 
 	// WS keepalive
 	pongWait   = 30 * time.Second
@@ -38,11 +36,7 @@ var upgrader = websocket.Upgrader{
 type openAIEvent map[string]any
 
 func main() {
-
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("No .env file found, relying on environment variables")
-	}
+	_ = godotenv.Load() // 沒有 .env 也沒關係
 
 	if os.Getenv("OPENAI_API_KEY") == "" {
 		log.Fatal("missing env OPENAI_API_KEY")
@@ -60,21 +54,23 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer clientConn.Close()
-
 	log.Println("client connected")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// client ws keepalive
+	// ---- client keepalive (重要：要跟其他 Write 共用同一把鎖，避免 concurrent write) ----
+	var clientWriteMu sync.Mutex
+
+	clientConn.SetReadLimit(8 * 1024 * 1024)
 	_ = clientConn.SetReadDeadline(time.Now().Add(pongWait))
 	clientConn.SetPongHandler(func(string) error {
 		_ = clientConn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
-	go pingLoop(ctx, clientConn)
+	go pingLoop(ctx, clientConn, &clientWriteMu)
 
-	// connect to OpenAI Realtime WS
+	// ---- connect to OpenAI Realtime ----
 	openaiConn, err := dialOpenAIRealtime()
 	if err != nil {
 		log.Println("dial openai error:", err)
@@ -82,52 +78,53 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer openaiConn.Close()
 
-	// OpenAI ws keepalive（可選，但建議）
+	// OpenAI read deadline / pong
+	openaiConn.SetReadLimit(8 * 1024 * 1024)
 	_ = openaiConn.SetReadDeadline(time.Now().Add(pongWait))
 	openaiConn.SetPongHandler(func(string) error {
 		_ = openaiConn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
-	go pingLoop(ctx, openaiConn)
 
-	// 送 session.update：把 input/output 都改成 16kHz，並關掉 server_vad（我們用 idle commit）
-	// session.created 的結構顯示 audio.input/output.format.type=audio/pcm、rate=24000 預設值 :contentReference[oaicite:10]{index=10}
-	// client events 也說 session.update 可更新多數欄位、turn_detection 可用 null 清除 :contentReference[oaicite:11]{index=11}
-	sendJSON(openaiConn, openAIEvent{
+	// ✅ 單一 writer：所有送給 OpenAI 的訊息（含 ping）都走這個 writer
+	openaiWriter := NewWSWriter(ctx, openaiConn)
+
+	// ---- session.update：開 server VAD + create_response=true（你就不用自己 commit/response.create）----
+	openaiWriter.SendJSON(openAIEvent{
 		"type": "session.update",
 		"session": openAIEvent{
-			"type": "realtime",
-			// 讓模型用中文回（你也可以放更完整 system 指令）
-			"instructions": "You are a helpful assistant that speaks in Traditional Chinese.",
+			"type":         "realtime",
+			"instructions": "請用中文與使用者自然對話，回覆以語音為主。",
+			"output_modalities": []string{
+				"audio",
+			},
 			"audio": openAIEvent{
 				"input": openAIEvent{
-					"format": openAIEvent{"type": "audio/pcm", "rate": inRateHz},
-					// 關掉 server VAD，改用我們自己的 idle commit（也可以不關，讓它自動 commit/create_response）
+					"format": openAIEvent{"type": "audio/pcm", "rate": rateHz},
 					"turn_detection": openAIEvent{
 						"type":                "server_vad",
 						"threshold":           0.5,
 						"prefix_padding_ms":   300,
 						"silence_duration_ms": 600,
-						"create_response":     true,
+						"create_response":     true, // ✅ 關鍵：自動產生回覆
 					},
 				},
 				"output": openAIEvent{
-					"format": openAIEvent{"type": "audio/pcm", "rate": outRateHz},
-					"voice":  "alloy",
+					"format": openAIEvent{"type": "audio/pcm", "rate": rateHz},
+					"voice":  "marin",
 					"speed":  1,
 				},
 			},
-			"output_modalities": []string{"audio"},
 		},
 	})
-	log.Println("→ session.update sent")
+	log.Println("→ session.update sent (server VAD enabled)")
 
-	// 從 OpenAI 收到 audio delta 就轉回 binary 給 client
-	var writeMu sync.Mutex // gorilla/websocket 不建議多 goroutine 同時 Write
+	// ---- OpenAI receiver：收到 audio delta 就轉回 binary 給 client ----
 	go func() {
 		for {
 			_, msg, err := openaiConn.ReadMessage()
 			if err != nil {
+				// 這通常是你 cancel / conn close 造成的，屬於正常收尾
 				log.Println("openai read error:", err)
 				cancel()
 				return
@@ -145,72 +142,35 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 			case "error":
 				pretty, _ := json.MarshalIndent(evt, "", "  ")
 				log.Printf("❌ openai error event:\n%s\n", string(pretty))
-				// 也可以把錯誤送回 client（文字）
-				writeMu.Lock()
+
+				// 把 error 也丟回 client（文字）
+				clientWriteMu.Lock()
 				_ = clientConn.WriteMessage(websocket.TextMessage, pretty)
-				writeMu.Unlock()
+				clientWriteMu.Unlock()
 
 			case "response.output_audio.delta":
-				// server events 定義：delta 是 base64 音訊 :contentReference[oaicite:12]{index=12}
 				delta, _ := evt["delta"].(string)
 				pcm, err := base64.StdEncoding.DecodeString(delta)
 				if err != nil {
 					log.Println("decode delta error:", err)
 					continue
 				}
-				writeMu.Lock()
+
+				clientWriteMu.Lock()
 				_ = clientConn.WriteMessage(websocket.BinaryMessage, pcm)
-				writeMu.Unlock()
+				clientWriteMu.Unlock()
 
 			case "response.done":
-				// response.done 一定會出現，代表這次回覆結束 :contentReference[oaicite:13]{index=13}
 				log.Println("🟢 response.done")
 
 			default:
-				// 初期建議先觀察有哪些事件（session.created / session.updated / response.created…）
+				// 初期你想觀察事件就留著；穩定後可註解掉避免洗版
 				log.Println("openai event:", t)
 			}
 		}
 	}()
 
-	// client → OpenAI：收到 binary 就 append；idle 一段時間就 commit + response.create
-	var bytesSinceCommit int
-	idleTimer := time.NewTimer(idleCommitAfter)
-	idleTimer.Stop()
-
-	resetIdle := func() {
-		if !idleTimer.Stop() {
-			select {
-			case <-idleTimer.C:
-			default:
-			}
-		}
-		idleTimer.Reset(idleCommitAfter)
-	}
-
-	// idle 時觸發 commit+response.create（commit 若 buffer 空會報錯，所以我們用 bytesSinceCommit 擋）:contentReference[oaicite:14]{index=14}
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-idleTimer.C:
-				if bytesSinceCommit > 0 {
-					log.Println("→ idle: commit + response.create")
-					sendJSON(openaiConn, openAIEvent{"type": "input_audio_buffer.commit"})
-					// response.create 會觸發推理並開始回覆 :contentReference[oaicite:15]{index=15}
-					sendJSON(openaiConn, openAIEvent{
-						"type": "response.create",
-						"response": openAIEvent{
-							"output_modalities": []string{"audio"},
-						},
-					})
-					bytesSinceCommit = 0
-				}
-			}
-		}
-	}()
-
+	// ---- Client → OpenAI：binary audio 直接 append（不再做 idle commit）----
 	for {
 		msgType, data, err := clientConn.ReadMessage()
 		if err != nil {
@@ -229,32 +189,32 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			// append audio bytes（Base64）:contentReference[oaicite:16]{index=16}
-			sendJSON(openaiConn, openAIEvent{
+			// 直接 append。server VAD 會自己決定何時 commit 並自動回覆
+			openaiWriter.SendJSON(openAIEvent{
 				"type":  "input_audio_buffer.append",
 				"audio": base64.StdEncoding.EncodeToString(data),
 			})
-			bytesSinceCommit += len(data)
-			resetIdle()
 
 		case websocket.TextMessage:
-			// 可選：手動控制
+			// debug/控制命令（可選）
 			cmd := string(data)
 			switch cmd {
-			case "commit":
-				if bytesSinceCommit > 0 {
-					log.Println("→ cmd commit + response.create")
-					sendJSON(openaiConn, openAIEvent{"type": "input_audio_buffer.commit"})
-					sendJSON(openaiConn, openAIEvent{"type": "response.create", "response": openAIEvent{"output_modalities": []string{"audio"}}})
-					bytesSinceCommit = 0
-				}
 			case "clear":
 				log.Println("→ cmd clear")
-				sendJSON(openaiConn, openAIEvent{"type": "input_audio_buffer.clear"})
-				bytesSinceCommit = 0
+				openaiWriter.SendJSON(openAIEvent{"type": "input_audio_buffer.clear"})
+
 			case "cancel":
 				log.Println("→ cmd response.cancel")
-				sendJSON(openaiConn, openAIEvent{"type": "response.cancel"})
+				openaiWriter.SendJSON(openAIEvent{"type": "response.cancel"})
+
+			case "force":
+				// 可選：強制讓模型開始回（有時你想立即回不想等 VAD）
+				log.Println("→ cmd response.create (force)")
+				openaiWriter.SendJSON(openAIEvent{
+					"type":     "response.create",
+					"response": openAIEvent{"output_modalities": []string{"audio"}},
+				})
+
 			default:
 				log.Println("client text:", cmd)
 			}
@@ -265,22 +225,60 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 func dialOpenAIRealtime() (*websocket.Conn, error) {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	h := http.Header{}
-	// WebSocket guide：server-to-server 用標準 API key + Authorization header :contentReference[oaicite:17]{index=17}
 	h.Set("Authorization", "Bearer "+apiKey)
 
 	conn, _, err := websocket.DefaultDialer.Dial(openAIRealtimeURL, h)
-	if err != nil {
-		return nil, err
+	return conn, err
+}
+
+// ---- 單一 Writer（含 ping）----
+// gorilla/websocket：同一條連線只允許一個 goroutine 寫入，這個結構就是為了解決它
+type WSWriter struct {
+	conn *websocket.Conn
+	ch   chan []byte
+}
+
+func NewWSWriter(ctx context.Context, conn *websocket.Conn) *WSWriter {
+	w := &WSWriter{
+		conn: conn,
+		ch:   make(chan []byte, 512),
 	}
-	return conn, nil
+
+	go func() {
+		t := time.NewTicker(pingPeriod)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case b := <-w.ch:
+				_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := w.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+					return
+				}
+
+			case <-t.C:
+				_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := w.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	return w
 }
 
-func sendJSON(conn *websocket.Conn, v any) {
+func (w *WSWriter) SendJSON(v any) {
 	b, _ := json.Marshal(v)
-	_ = conn.WriteMessage(websocket.TextMessage, b)
+	// 這裡用阻塞，確保不丟控制訊息；要更低延遲可改成滿了就丟 audio（但不丟 control）
+	w.ch <- b
 }
 
-func pingLoop(ctx context.Context, conn *websocket.Conn) {
+// clientConn 的 ping loop：注意要用同一把 clientWriteMu
+func pingLoop(ctx context.Context, conn *websocket.Conn, mu *sync.Mutex) {
 	t := time.NewTicker(pingPeriod)
 	defer t.Stop()
 	for {
@@ -289,7 +287,10 @@ func pingLoop(ctx context.Context, conn *websocket.Conn) {
 			return
 		case <-t.C:
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			mu.Lock()
+			err := conn.WriteMessage(websocket.PingMessage, nil)
+			mu.Unlock()
+			if err != nil {
 				return
 			}
 		}

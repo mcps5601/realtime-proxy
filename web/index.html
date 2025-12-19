@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Realtime Voice Test</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "PingFang TC", "Noto Sans TC", sans-serif; padding: 20px; }
+    button { padding: 10px 14px; margin-right: 10px; }
+    #status { margin: 10px 0; }
+    #log { white-space: pre-wrap; background:#111; color:#0f0; padding:12px; border-radius:10px; height: 260px; overflow:auto; }
+    .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin: 10px 0; }
+    input { padding: 8px; width: 380px; max-width: 90vw; }
+    label { cursor: pointer; }
+    .hint { color:#555; font-size: 14px; margin-top:8px; line-height: 1.4; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eee; }
+  </style>
+</head>
+<body>
+  <h2>Realtime Voice Test (Mic → Go /ws → OpenAI Realtime → Audio)</h2>
+
+  <div class="row">
+    <label>WS URL：</label>
+    <input id="wsUrl" value="ws://localhost:8080/ws" />
+    <button id="btnConnect">Connect</button>
+  </div>
+
+  <div id="status">狀態：未連線</div>
+
+  <div class="row">
+    <strong>模式：</strong>
+    <label><input type="radio" name="mode" value="clip" checked> 1) 錄一段音再播回覆</label>
+    <label><input type="radio" name="mode" value="live"> 2) 自然對話（串流開關）</label>
+  </div>
+
+  <div class="row" id="clipControls">
+    <button id="btnRecord5" disabled>Record 5s</button>
+    <span class="pill">會顯示 [start recording] / [end recording]</span>
+  </div>
+
+  <div class="row" id="liveControls" style="display:none;">
+    <button id="btnLiveToggle" disabled>Start Live</button>
+    <span class="pill">開著就一直串流，server VAD 決定何時回覆</span>
+  </div>
+
+  <div class="hint">
+    <div>音訊格式：前端會把麥克風 downsample 成 <b>PCM16 / mono / 24000Hz</b> 再送到後端。</div>
+    <div>⚠️ 自然對話模式建議戴耳機，避免 AI 回覆被麥克風收進去造成回音/誤觸發。</div>
+  </div>
+
+  <h3>Log</h3>
+  <div id="log"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
+  const statusEl = $("status");
+  const wsUrlEl = $("wsUrl");
+  const btnConnect = $("btnConnect");
+  const btnRecord5 = $("btnRecord5");
+  const btnLiveToggle = $("btnLiveToggle");
+  const clipControls = $("clipControls");
+  const liveControls = $("liveControls");
+
+  const TARGET_SR = 24000;           // 必須 >= 24000（你後端已驗證）
+  const CHANNELS = 1;
+  const RECORD_SEC = 5;              // 模式1固定錄 5 秒
+  const TAIL_SILENCE_MS = 900;       // 模式1錄完補靜音尾巴，幫 VAD 收尾更穩
+  const FRAME_MS = 20;               // 20ms 一包靜音 tail
+
+  let ws = null;
+  let audioCtx = null;
+  let mediaStream = null;
+  let sourceNode = null;
+  let processorNode = null;
+
+  let streaming = false;   // 是否正在送麥克風資料
+  let liveOn = false;      // 模式2是否開啟
+  let playTime = 0;        // 播放排程
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent += `[${t}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function setStatus(s) { statusEl.textContent = `狀態：${s}`; }
+
+  function ensureAudioContext() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      playTime = audioCtx.currentTime + 0.05;
+      log(`AudioContext sampleRate=${audioCtx.sampleRate}`);
+    }
+    return audioCtx;
+  }
+
+  function wsConnected() {
+    return ws && ws.readyState === WebSocket.OPEN;
+  }
+
+  function connectWS() {
+    const url = wsUrlEl.value.trim();
+    if (!url) return;
+
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      setStatus(`已連線：${url}`);
+      log(`WS connected: ${url}`);
+      btnRecord5.disabled = false;
+      btnLiveToggle.disabled = false;
+      btnConnect.textContent = "Disconnect";
+    };
+
+    ws.onclose = () => {
+      setStatus("已斷線");
+      log("WS closed");
+      btnRecord5.disabled = true;
+      btnLiveToggle.disabled = true;
+      btnConnect.textContent = "Connect";
+      stopStreamInternal();
+      liveOn = false;
+      btnLiveToggle.textContent = "Start Live";
+    };
+
+    ws.onerror = (e) => {
+      log("WS error（看 console）");
+      console.error(e);
+    };
+
+    ws.onmessage = (evt) => {
+      if (typeof evt.data === "string") {
+        // 你後端遇到 openai error 時會丟回 text JSON
+        log(`TEXT <- ${evt.data}`);
+        return;
+      }
+      // Binary PCM16 mono @ 24000Hz
+      const pcmBytes = new Uint8Array(evt.data);
+      if (pcmBytes.byteLength > 0) playPCM16(pcmBytes, TARGET_SR);
+    };
+  }
+
+  function disconnectWS() {
+    if (ws) ws.close();
+    ws = null;
+  }
+
+  function downsampleFloatToPCM16(float32, inSampleRate, outSampleRate) {
+    // linear resample float[-1..1] -> int16
+    const ratio = inSampleRate / outSampleRate;
+    const outLength = Math.floor(float32.length / ratio);
+    const out = new Int16Array(outLength);
+
+    for (let i = 0; i < outLength; i++) {
+      const pos = i * ratio;
+      const i0 = Math.floor(pos);
+      const i1 = Math.min(i0 + 1, float32.length - 1);
+      const frac = pos - i0;
+      const sample = float32[i0] * (1 - frac) + float32[i1] * frac;
+      let s = Math.max(-1, Math.min(1, sample));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+
+  function sendPCM16(int16) {
+    if (!wsConnected()) return;
+    ws.send(int16.buffer); // little-endian
+  }
+
+  async function startStream() {
+    if (streaming) return;
+    if (!wsConnected()) { log("請先 Connect"); return; }
+
+    const ctx = ensureAudioContext();
+    if (ctx.state !== "running") await ctx.resume();
+
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }
+    });
+
+    sourceNode = ctx.createMediaStreamSource(mediaStream);
+
+    // 測試用 ScriptProcessor（production 建議 AudioWorklet）
+    const bufferSize = 1024;
+    processorNode = ctx.createScriptProcessor(bufferSize, 1, 1);
+
+    processorNode.onaudioprocess = (e) => {
+      if (!streaming) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const pcm16 = downsampleFloatToPCM16(input, ctx.sampleRate, TARGET_SR);
+      sendPCM16(pcm16);
+    };
+
+    // 不把麥克風播放到喇叭（避免回授），但需要接到 destination 才會觸發 onaudioprocess
+    sourceNode.connect(processorNode);
+    processorNode.connect(ctx.destination);
+
+    streaming = true;
+  }
+
+  function stopStreamInternal() {
+    streaming = false;
+
+    try {
+      if (processorNode) processorNode.disconnect();
+      if (sourceNode) sourceNode.disconnect();
+      processorNode = null;
+      sourceNode = null;
+
+      if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  async function sendSilenceTail(ms) {
+    const frameSamples = Math.floor(TARGET_SR * (FRAME_MS / 1000)); // 480 samples at 24kHz/20ms
+    const frame = new Int16Array(frameSamples); // zeros
+    const frames = Math.ceil(ms / FRAME_MS);
+
+    for (let i = 0; i < frames; i++) {
+      sendPCM16(frame);
+      await sleep(FRAME_MS);
+    }
+    log(`(sent ${ms}ms silence tail)`);
+  }
+
+  function playPCM16(pcmBytes, sampleRate) {
+    const ctx = ensureAudioContext();
+
+    const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+    const n = pcmBytes.byteLength / 2;
+    const float32 = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const s = view.getInt16(i * 2, true);
+      float32[i] = s / 32768;
+    }
+
+    const buffer = ctx.createBuffer(1, float32.length, sampleRate);
+    buffer.copyToChannel(float32, 0);
+
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+
+    const now = ctx.currentTime;
+    if (playTime < now + 0.05) playTime = now + 0.05;
+    src.start(playTime);
+    playTime += buffer.duration;
+  }
+
+  // ---- Mode 1: Record 5s then stop, send tail, wait for reply (plays automatically) ----
+  async function record5s() {
+    if (!wsConnected()) { log("請先 Connect"); return; }
+
+    log("[start recording]");
+    setStatus("錄音中（5s）…");
+    btnRecord5.disabled = true;
+    btnLiveToggle.disabled = true;
+
+    await startStream();
+    await sleep(RECORD_SEC * 1000);
+
+    streaming = false;
+    log("[end recording]");
+    setStatus("停止錄音，等待回覆…");
+
+    // 補靜音尾巴，幫 server VAD 可靠 end-of-turn
+    await sendSilenceTail(TAIL_SILENCE_MS);
+
+    stopStreamInternal();
+    btnRecord5.disabled = false;
+    btnLiveToggle.disabled = false;
+    setStatus("已連線（可再錄/可切換模式）");
+  }
+
+  // ---- Mode 2: Live toggle (one button) ----
+  async function toggleLive() {
+    if (!wsConnected()) { log("請先 Connect"); return; }
+
+    if (!liveOn) {
+      liveOn = true;
+      btnLiveToggle.textContent = "Stop Live";
+      setStatus("Live 串流中（自然對話）…");
+      log("Live ON");
+      await startStream();
+      return;
+    }
+
+    // turn off
+    liveOn = false;
+    btnLiveToggle.textContent = "Start Live";
+    log("Live OFF");
+    setStatus("停止 Live，等待回覆…");
+
+    streaming = false;
+    // 讓你停下後也能促成一次結束（可選，但很實用）
+    await sendSilenceTail(700);
+
+    stopStreamInternal();
+    setStatus("已連線");
+  }
+
+  // UI mode switch
+  function updateModeUI() {
+    const mode = document.querySelector('input[name="mode"]:checked').value;
+    if (mode === "clip") {
+      clipControls.style.display = "";
+      liveControls.style.display = "none";
+    } else {
+      clipControls.style.display = "none";
+      liveControls.style.display = "";
+    }
+  }
+  document.querySelectorAll('input[name="mode"]').forEach(r => r.addEventListener("change", updateModeUI));
+  updateModeUI();
+
+  btnConnect.onclick = () => {
+    if (wsConnected()) disconnectWS();
+    else connectWS();
+  };
+
+  btnRecord5.onclick = () => record5s().catch(err => { log("record error"); console.error(err); });
+  btnLiveToggle.onclick = () => toggleLive().catch(err => { log("live error"); console.error(err); });
+
+  if (!window.isSecureContext) {
+    log("⚠️ getUserMedia 需要 https 或 localhost。請用 http://localhost 開這頁。");
+  }
+})();
+</script>
+</body>
+</html>
