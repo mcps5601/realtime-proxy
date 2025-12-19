@@ -103,7 +103,13 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 				"input": openAIEvent{
 					"format": openAIEvent{"type": "audio/pcm", "rate": inRateHz},
 					// 關掉 server VAD，改用我們自己的 idle commit（也可以不關，讓它自動 commit/create_response）
-					"turn_detection": nil,
+					"turn_detection": openAIEvent{
+						"type":                "server_vad",
+						"threshold":           0.5,
+						"prefix_padding_ms":   300,
+						"silence_duration_ms": 600,
+						"create_response":     true,
+					},
 				},
 				"output": openAIEvent{
 					"format": openAIEvent{"type": "audio/pcm", "rate": outRateHz},
