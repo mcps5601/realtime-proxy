@@ -24,7 +24,7 @@ const (
 	// WS keepalive
 	pongWait   = 30 * time.Second
 	pingPeriod = 10 * time.Second
-	writeWait  = 5 * time.Second
+	writeWait  = 15 * time.Second // 增加到 15s，避免前端忙碌時超時
 )
 
 var upgrader = websocket.Upgrader{
@@ -63,9 +63,9 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	var clientWriteMu sync.Mutex
 
 	clientConn.SetReadLimit(8 * 1024 * 1024)
-	_ = clientConn.SetReadDeadline(time.Now().Add(pongWait))
+	clientConn.SetReadDeadline(time.Time{}) // 沒有讀取超時（ping/pong 會維持連線）
 	clientConn.SetPongHandler(func(string) error {
-		_ = clientConn.SetReadDeadline(time.Now().Add(pongWait))
+		clientConn.SetReadDeadline(time.Time{}) // 重置為無超時
 		return nil
 	})
 	go pingLoop(ctx, clientConn, &clientWriteMu)
@@ -90,7 +90,7 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 	openaiWriter := NewWSWriter(ctx, openaiConn)
 
 	// ---- session.update：開 server VAD + create_response=true（你就不用自己 commit/response.create）----
-	openaiWriter.SendJSON(openAIEvent{
+	openaiWriter.SendControl(openAIEvent{
 		"type": "session.update",
 		"session": openAIEvent{
 			"type":         "realtime",
@@ -156,9 +156,13 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
+				log.Printf("→ sending %d bytes of PCM to client\n", len(pcm))
 				clientWriteMu.Lock()
-				_ = clientConn.WriteMessage(websocket.BinaryMessage, pcm)
+				err = clientConn.WriteMessage(websocket.BinaryMessage, pcm)
 				clientWriteMu.Unlock()
+				if err != nil {
+					log.Printf("failed to send PCM to client: %v\n", err)
+				}
 
 			case "response.done":
 				log.Println("🟢 response.done")
@@ -189,8 +193,9 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			// 直接 append。server VAD 會自己決定何時 commit 並自動回覆
-			openaiWriter.SendJSON(openAIEvent{
+			// 直接 append。OpenAI Realtime 會自動進行 cut-through
+			// （當有新 input 時自動中斷 response，不需要手動 cancel）
+			openaiWriter.SendAudio(openAIEvent{
 				"type":  "input_audio_buffer.append",
 				"audio": base64.StdEncoding.EncodeToString(data),
 			})
@@ -201,16 +206,15 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 			switch cmd {
 			case "clear":
 				log.Println("→ cmd clear")
-				openaiWriter.SendJSON(openAIEvent{"type": "input_audio_buffer.clear"})
+				openaiWriter.SendControl(openAIEvent{"type": "input_audio_buffer.clear"})
 
 			case "cancel":
 				log.Println("→ cmd response.cancel")
-				openaiWriter.SendJSON(openAIEvent{"type": "response.cancel"})
-
+				openaiWriter.SendControl(openAIEvent{"type": "response.cancel"})
 			case "force":
 				// 可選：強制讓模型開始回（有時你想立即回不想等 VAD）
 				log.Println("→ cmd response.create (force)")
-				openaiWriter.SendJSON(openAIEvent{
+				openaiWriter.SendControl(openAIEvent{
 					"type":     "response.create",
 					"response": openAIEvent{"output_modalities": []string{"audio"}},
 				})
@@ -234,47 +238,71 @@ func dialOpenAIRealtime() (*websocket.Conn, error) {
 // ---- 單一 Writer（含 ping）----
 // gorilla/websocket：同一條連線只允許一個 goroutine 寫入，這個結構就是為了解決它
 type WSWriter struct {
-	conn *websocket.Conn
-	ch   chan []byte
+	conn      *websocket.Conn
+	controlCh chan []byte
+	audioCh   chan []byte
 }
 
 func NewWSWriter(ctx context.Context, conn *websocket.Conn) *WSWriter {
 	w := &WSWriter{
-		conn: conn,
-		ch:   make(chan []byte, 512),
+		conn:      conn,
+		controlCh: make(chan []byte),    // 不丟，保序
+		audioCh:   make(chan []byte, 4), // ~80ms audio buffer
 	}
 
-	go func() {
-		t := time.NewTicker(pingPeriod)
-		defer t.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-
-			case b := <-w.ch:
-				_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
-				if err := w.conn.WriteMessage(websocket.TextMessage, b); err != nil {
-					return
-				}
-
-			case <-t.C:
-				_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
-				if err := w.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
+	go w.loop(ctx)
 	return w
 }
 
-func (w *WSWriter) SendJSON(v any) {
+func (w *WSWriter) loop(ctx context.Context) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		// 1️⃣ Control 優先
+		case msg := <-w.controlCh:
+			_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := w.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+
+		// 2️⃣ Audio（可能被丟）
+		case msg := <-w.audioCh:
+			_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := w.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+
+		// 3️⃣ Ping
+		case <-ticker.C:
+			_ = w.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := w.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (w *WSWriter) SendControl(v any) {
 	b, _ := json.Marshal(v)
-	// 這裡用阻塞，確保不丟控制訊息；要更低延遲可改成滿了就丟 audio（但不丟 control）
-	w.ch <- b
+	w.controlCh <- b // block 是刻意的
+}
+
+func (w *WSWriter) SendAudio(v any) {
+	b, _ := json.Marshal(v)
+
+	select {
+	case w.audioCh <- b:
+		// 成功送進 buffer
+	default:
+		// buffer 滿了，丟掉最舊的
+		<-w.audioCh
+		w.audioCh <- b
+	}
 }
 
 // clientConn 的 ping loop：注意要用同一把 clientWriteMu

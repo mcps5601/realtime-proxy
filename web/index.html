@@ -121,6 +121,8 @@
     };
 
     ws.onmessage = (evt) => {
+      console.log("ws.onmessage received:", typeof evt.data, evt.data instanceof ArrayBuffer ? `ArrayBuffer(${evt.data.byteLength} bytes)` : (typeof evt.data === "string" ? evt.data.substring(0, 100) : "unknown"));
+
       if (typeof evt.data === "string") {
         // 你後端遇到 openai error 時會丟回 text JSON
         log(`TEXT <- ${evt.data}`);
@@ -128,7 +130,11 @@
       }
       // Binary PCM16 mono @ 24000Hz
       const pcmBytes = new Uint8Array(evt.data);
-      if (pcmBytes.byteLength > 0) playPCM16(pcmBytes, TARGET_SR);
+      console.log(`onmessage: got ${pcmBytes.byteLength} bytes of audio`);
+      if (pcmBytes.byteLength > 0) {
+        console.log("calling playPCM16...");
+        playPCM16(pcmBytes, TARGET_SR);
+      }
     };
   }
 
@@ -200,8 +206,16 @@
     streaming = false;
 
     try {
-      if (processorNode) processorNode.disconnect();
-      if (sourceNode) sourceNode.disconnect();
+      if (processorNode) {
+        processorNode.disconnect();
+        // 完全斷開所有連接
+        try { processorNode.disconnect(audioCtx.destination); } catch (e) {}
+      }
+      if (sourceNode) {
+        sourceNode.disconnect();
+        // 完全斷開所有連接
+        try { sourceNode.disconnect(processorNode); } catch (e) {}
+      }
       processorNode = null;
       sourceNode = null;
 
@@ -227,27 +241,35 @@
   }
 
   function playPCM16(pcmBytes, sampleRate) {
-    const ctx = ensureAudioContext();
+    try {
+      const ctx = ensureAudioContext();
 
-    const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
-    const n = pcmBytes.byteLength / 2;
-    const float32 = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      const s = view.getInt16(i * 2, true);
-      float32[i] = s / 32768;
+      const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+      const n = pcmBytes.byteLength / 2;
+      const float32 = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const s = view.getInt16(i * 2, true);
+        float32[i] = s / 32768;
+      }
+
+      const buffer = ctx.createBuffer(1, float32.length, sampleRate);
+      buffer.copyToChannel(float32, 0);
+
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      // 簡單方案：每次都用 now + 50ms 起播
+      const startTime = Math.max(now + 0.05, playTime);
+      src.start(startTime);
+      playTime = startTime + buffer.duration;
+
+      console.log(`playPCM16: ${n} samples, duration=${buffer.duration.toFixed(3)}s, now=${now.toFixed(3)}, startTime=${startTime.toFixed(3)}, nextPlayTime=${playTime.toFixed(3)}`);
+    } catch (e) {
+      console.error("playPCM16 error:", e);
+      log("playPCM16 error: " + e.message);
     }
-
-    const buffer = ctx.createBuffer(1, float32.length, sampleRate);
-    buffer.copyToChannel(float32, 0);
-
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(ctx.destination);
-
-    const now = ctx.currentTime;
-    if (playTime < now + 0.05) playTime = now + 0.05;
-    src.start(playTime);
-    playTime += buffer.duration;
   }
 
   // ---- Mode 1: Record 5s then stop, send tail, wait for reply (plays automatically) ----
