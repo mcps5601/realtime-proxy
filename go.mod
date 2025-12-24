@@ -1,4 +1,4 @@
-module local
+module github.com/robinwang/realtime_proxy
 
 go 1.25.5
 
