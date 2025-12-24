@@ -12,6 +12,7 @@ my-local-project
 
 # Env files
 *.env
+.DS_Store
 
 # Logs
 uploads/
