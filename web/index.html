@@ -69,6 +69,26 @@
   let liveOn = false;      // 模式2是否開啟
   let playTime = 0;        // 播放排程
 
+  // ---- playback interruption / barge-in ----
+  let currentGen = 0n;                 // BigInt
+  const activeSources = new Set();     // AudioBufferSourceNode
+
+  function stopPlayback() {
+    try {
+      for (const src of activeSources) {
+        try { src.stop(0); } catch (e) {}
+        try { src.disconnect(); } catch (e) {}
+      }
+      activeSources.clear();
+      if (audioCtx) {
+        playTime = audioCtx.currentTime + 0.05;
+      }
+      log("[playback interrupted]");
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
   function log(msg) {
     const t = new Date().toLocaleTimeString();
     logEl.textContent += `[${t}] ${msg}\n`;
@@ -111,6 +131,11 @@
       btnLiveToggle.disabled = true;
       btnConnect.textContent = "Connect";
       stopStreamInternal();
+
+      // reset playback state
+      stopPlayback();
+      currentGen = 0n;
+
       liveOn = false;
       btnLiveToggle.textContent = "Start Live";
     };
@@ -124,17 +149,60 @@
       console.log("ws.onmessage received:", typeof evt.data, evt.data instanceof ArrayBuffer ? `ArrayBuffer(${evt.data.byteLength} bytes)` : (typeof evt.data === "string" ? evt.data.substring(0, 100) : "unknown"));
 
       if (typeof evt.data === "string") {
-        // 你後端遇到 openai error 時會丟回 text JSON
+        // 後端可能丟回：openai error JSON 或 playback.interrupt
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg && msg.type === "playback.interrupt") {
+            const nextGen = BigInt(msg.gen);
+            if (nextGen > currentGen) currentGen = nextGen;
+            stopPlayback();
+            return;
+          }
+        } catch (e) {
+          // not JSON
+        }
         log(`TEXT <- ${evt.data}`);
         return;
       }
-      // Binary PCM16 mono @ 24000Hz
-      const pcmBytes = new Uint8Array(evt.data);
-      console.log(`onmessage: got ${pcmBytes.byteLength} bytes of audio`);
-      if (pcmBytes.byteLength > 0) {
-        console.log("calling playPCM16...");
-        playPCM16(pcmBytes, TARGET_SR);
+
+      // Binary audio:
+      // - legacy: pure PCM16
+      // - framed (preferred): 1B kind(0x01) + 8B gen(le) + PCM payload
+      const bytes = new Uint8Array(evt.data);
+      if (bytes.byteLength <= 0) return;
+
+      let kind = 0;
+      let gen = currentGen;
+      let payload = bytes;
+
+      // framed audio 一定是「奇數長度」：9 bytes header + 偶數長度 PCM payload
+      // 這可以避免把 legacy raw PCM（偶數長度）誤判成 framed。
+      if (bytes.byteLength >= 9 && (bytes.byteLength % 2 === 1) && bytes[0] === 0x01) {
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        kind = bytes[0];
+        gen = dv.getBigUint64(1, true);
+        payload = bytes.subarray(9);
+        if (gen > currentGen) {
+          currentGen = gen;
+          stopPlayback();
+        }
+        if (gen < currentGen) {
+          // drop old-generation audio
+          return;
+        }
+      } else {
+        // legacy raw PCM
+        kind = 0x01;
       }
+
+      if (kind !== 0x01) return;
+      if (payload.byteLength % 2 !== 0) {
+        console.warn("bad PCM payload length:", payload.byteLength);
+        return;
+      }
+
+      console.log(`onmessage: got ${payload.byteLength} bytes of audio (gen=${gen.toString()})`);
+      playPCM16(payload, TARGET_SR);
     };
   }
 
@@ -244,8 +312,21 @@
     try {
       const ctx = ensureAudioContext();
 
-      const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
-      const n = pcmBytes.byteLength / 2;
+      // Defensive: 確保 buffer 從 offset=0 開始，避免某些瀏覽器對 subarray+DataView 的邊界行為不一致。
+      // 這會做一次小拷貝，但可避免 DataView out-of-bounds。
+      let pcm = pcmBytes;
+      if (pcm instanceof Uint8Array) {
+        pcm = pcm.slice();
+      } else {
+        pcm = new Uint8Array(pcmBytes);
+      }
+      if (pcm.byteLength < 2 || (pcm.byteLength % 2 !== 0)) {
+        console.warn("playPCM16: bad pcm length", pcm.byteLength);
+        return;
+      }
+
+      const view = new DataView(pcm.buffer);
+      const n = pcm.byteLength >> 1;
       const float32 = new Float32Array(n);
       for (let i = 0; i < n; i++) {
         const s = view.getInt16(i * 2, true);
@@ -258,6 +339,11 @@
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);
+
+      activeSources.add(src);
+      src.onended = () => {
+        activeSources.delete(src);
+      };
 
       const now = ctx.currentTime;
       // 簡單方案：每次都用 now + 50ms 起播

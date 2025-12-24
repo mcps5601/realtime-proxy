@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -48,13 +49,23 @@ func main() {
 }
 
 func handleClientWS(w http.ResponseWriter, r *http.Request) {
+	// raw=1: server->client 只送純 PCM binary（不送任何 Text 控制訊息/錯誤），方便用 websocat 直接存檔播放。
+	// 預設（raw=0）會走 framed binary：1B kind + 8B gen + PCM payload。
+	rawMode := r.URL.Query().Get("raw") == "1"
+	framedBinary := !rawMode
+	clientAcceptsText := !rawMode
+
 	clientConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("upgrade error:", err)
 		return
 	}
 	defer clientConn.Close()
-	log.Println("client connected")
+	if rawMode {
+		log.Println("client connected (raw=1)")
+	} else {
+		log.Println("client connected")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -121,6 +132,42 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 	// ---- OpenAI receiver：收到 audio delta 就轉回 binary 給 client ----
 	go func() {
+		var gen uint64
+		inSpeech := false
+		allowAudio := true
+		responseActive := false
+
+		interruptPlayback := func(reason string) {
+			gen++
+			allowAudio = false
+
+			if clientAcceptsText {
+				msg, _ := json.Marshal(openAIEvent{
+					"type":   "playback.interrupt",
+					"gen":    gen,
+					"reason": reason,
+				})
+				clientWriteMu.Lock()
+				_ = clientConn.WriteMessage(websocket.TextMessage, msg)
+				clientWriteMu.Unlock()
+			}
+
+			// 盡量讓 OpenAI 停掉舊 response（即使仍有少量尾包，前端也會丟掉）
+			// 注意：若沒有 active response，直接 cancel 會回 response_cancel_not_active。
+			if responseActive {
+				openaiWriter.SendControl(openAIEvent{"type": "response.cancel"})
+			}
+		}
+
+		framePCM := func(pcm []byte) []byte {
+			// 1B kind(0x01 audio) + 8B gen (little-endian) + PCM payload
+			buf := make([]byte, 1+8+len(pcm))
+			buf[0] = 0x01
+			binary.LittleEndian.PutUint64(buf[1:9], gen)
+			copy(buf[9:], pcm)
+			return buf
+		}
+
 		for {
 			_, msg, err := openaiConn.ReadMessage()
 			if err != nil {
@@ -139,16 +186,46 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 			t, _ := evt["type"].(string)
 
 			switch t {
+			case "input_audio_buffer.speech_started":
+				// 使用者開始說話：立刻打斷 client 播放並丟掉舊音訊
+				log.Println("openai event:", t)
+				if !inSpeech {
+					inSpeech = true
+					interruptPlayback("speech_started")
+				}
+
+			case "input_audio_buffer.speech_stopped":
+				log.Println("openai event:", t)
+				inSpeech = false
+				// 若 response 已經 created（少數情境可能先到），就可恢復轉發
+				if responseActive {
+					allowAudio = true
+				}
+
+			case "response.created":
+				log.Println("openai event:", t)
+				responseActive = true
+				if !inSpeech {
+					allowAudio = true
+				}
+
 			case "error":
 				pretty, _ := json.MarshalIndent(evt, "", "  ")
 				log.Printf("❌ openai error event:\n%s\n", string(pretty))
 
 				// 把 error 也丟回 client（文字）
-				clientWriteMu.Lock()
-				_ = clientConn.WriteMessage(websocket.TextMessage, pretty)
-				clientWriteMu.Unlock()
+				if clientAcceptsText {
+					clientWriteMu.Lock()
+					_ = clientConn.WriteMessage(websocket.TextMessage, pretty)
+					clientWriteMu.Unlock()
+				}
 
 			case "response.output_audio.delta":
+				if !allowAudio {
+					// barge-in 期間：丟掉舊 response 的 audio（避免 tail 音）
+					continue
+				}
+
 				delta, _ := evt["delta"].(string)
 				pcm, err := base64.StdEncoding.DecodeString(delta)
 				if err != nil {
@@ -158,7 +235,11 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 				log.Printf("→ sending %d bytes of PCM to client\n", len(pcm))
 				clientWriteMu.Lock()
-				err = clientConn.WriteMessage(websocket.BinaryMessage, pcm)
+				if framedBinary {
+					err = clientConn.WriteMessage(websocket.BinaryMessage, framePCM(pcm))
+				} else {
+					err = clientConn.WriteMessage(websocket.BinaryMessage, pcm)
+				}
 				clientWriteMu.Unlock()
 				if err != nil {
 					log.Printf("failed to send PCM to client: %v\n", err)
@@ -166,6 +247,13 @@ func handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 			case "response.done":
 				log.Println("🟢 response.done")
+				responseActive = false
+
+				// 在某些 edge case，如果 speech_started 期間把 allowAudio 關掉，
+				// response.done 後回到 idle 狀態，允許下一輪 response 轉發。
+				if !inSpeech {
+					allowAudio = true
+				}
 
 			default:
 				// 初期你想觀察事件就留著；穩定後可註解掉避免洗版

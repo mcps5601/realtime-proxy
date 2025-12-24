@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL="${1:-ws://localhost:8080/ws}"
+URL="${1:-ws://localhost:8080/ws?raw=1}"
 
 # Realtime 這裡你已經驗證過要用 24000
 RATE="${RATE:-24000}"
